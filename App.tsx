@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Zap, Copy, Check, ShieldCheck, 
-  ArrowRight, Plus, Send, Smartphone, Settings, AlertTriangle, Archive, Grid as GridIcon, List as ListIcon, X
+  ArrowRight, Plus, Send, Smartphone, Settings, AlertTriangle, Archive, Grid as GridIcon, List as ListIcon, X, Maximize2, Palette
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { v4 as uuidv4 } from 'uuid';
@@ -12,11 +12,14 @@ import { FilePreview } from './components/FilePreview';
 import { Radar } from './components/Radar';
 import { FullScreenPreview } from './components/FullScreenPreview';
 import { SettingsModal } from './components/SettingsModal';
-import { ConnectionStatus, FileMeta, PeerUser, DevSettings, TronsferID } from './types';
+import { MeshCanvas } from './components/MeshCanvas';
+import { ConnectionStatus, FileMeta, PeerUser, DevSettings, DrawStroke } from './types';
 import { DiscoveryService } from './services/discoveryService';
 import { compressImage } from './services/compressionService';
 
 const APP_ID_PREFIX = 'lumina-drop-';
+const HEARTBEAT_INTERVAL = 2000;
+const CONNECTION_TIMEOUT = 10000; // 10s timeout
 const generateShortId = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
 // Sound Synthesizer
@@ -63,7 +66,7 @@ function App() {
     const isTablet = /iPad/i.test(navigator.userAgent);
     const type = isTablet ? 't' : (isMobile ? 'p' : 'm');
     const optimized = 'y'; 
-    return `C${type}${optimized}1.0`;
+    return `C${type}${optimized}2.6`;
   };
   const APP_VERSION_STRING = getDeviceVersion();
   const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -77,6 +80,7 @@ function App() {
   const [peerInstance, setPeerInstance] = useState<any>(null);
   const [conn, setConn] = useState<any>(null);
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
+  const [reconnectCountdown, setReconnectCountdown] = useState(10);
   const [requester, setRequester] = useState<{id: string, nickname: string, version?: string} | null>(null);
   
   const [files, setFiles] = useState<FileMeta[]>([]);
@@ -89,10 +93,13 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [isFocusMode, setIsFocusMode] = useState(false); 
   
-  // vC1.0 States
+  // vC1.0 & vC2.6 States
   const [showVault, setShowVault] = useState(false);
   const [vaultFiles, setVaultFiles] = useState<FileMeta[]>([]);
   const [pendingCompression, setPendingCompression] = useState<{file: File, id: string} | null>(null);
+  const [isMeshActive, setIsMeshActive] = useState(false);
+  const [strokes, setStrokes] = useState<DrawStroke[]>([]);
+  const [currentStroke, setCurrentStroke] = useState<DrawStroke | null>(null);
 
   const [devSettings, setDevSettings] = useState<DevSettings>({
       autoAccept: false,
@@ -102,12 +109,10 @@ function App() {
       stealthMode: false,
       sonicPulse: true,
       sonicPulseType: 'droplet',
-      // C1.0 Features
       sharedCanvas: false,
       mediaVault: false,
       smartContinuity: false,
       smartCompression: false,
-      // Legacy
       infinityLink: false,
       autoVanish: false,
   });
@@ -115,6 +120,8 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const discoveryService = useRef<DiscoveryService | null>(null);
   const wakeLockRef = useRef<any>(null);
+  const heartbeatTimer = useRef<any>(null);
+  const lastHeartbeat = useRef<number>(Date.now());
 
   // --- Vault Persistence ---
   useEffect(() => {
@@ -126,8 +133,7 @@ function App() {
 
   const addToVault = (file: FileMeta) => {
       if (!devSettings.mediaVault) return;
-      // We can't store Blobs in localStorage, so we mock it with meta data
-      const safeFile = { ...file, blob: undefined, url: undefined };
+      const safeFile = { ...file, blob: undefined, url: undefined }; // Don't persist BLOBs to storage
       setVaultFiles(prev => {
           const next = [safeFile, ...prev];
           localStorage.setItem('tronsfer_vault', JSON.stringify(next));
@@ -135,22 +141,44 @@ function App() {
       });
   };
 
-  // --- Wake Lock ---
+  // --- Heartbeat Logic ---
   useEffect(() => {
-    if (devSettings.infinityLink) {
-        if ('wakeLock' in navigator) {
-            // @ts-ignore
-            navigator.wakeLock.request('screen')
-                .then((lock: any) => { wakeLockRef.current = lock; })
-                .catch((e: any) => console.log('Wake Lock denied', e));
-        }
-    } else {
-        if (wakeLockRef.current) {
-            wakeLockRef.current.release();
-            wakeLockRef.current = null;
-        }
+    if (status === ConnectionStatus.CONNECTED && conn) {
+        // Send Ping
+        const pingInterval = setInterval(() => {
+            try { conn.send({ type: 'heartbeat-ping' }); } catch(e) {}
+            
+            // Check timeout
+            const timeSinceLastPong = Date.now() - lastHeartbeat.current;
+            if (timeSinceLastPong > CONNECTION_TIMEOUT) {
+                 setStatus(ConnectionStatus.RECONNECTING);
+                 // If already reconnecting, countdown handled by UI effect?
+            } else {
+                 if (status === ConnectionStatus.RECONNECTING) setStatus(ConnectionStatus.CONNECTED);
+            }
+        }, HEARTBEAT_INTERVAL);
+
+        return () => clearInterval(pingInterval);
     }
-  }, [devSettings.infinityLink]);
+  }, [status, conn]);
+
+  useEffect(() => {
+      let interval: any;
+      if (status === ConnectionStatus.RECONNECTING) {
+          setReconnectCountdown(10);
+          interval = setInterval(() => {
+              setReconnectCountdown(prev => {
+                  if (prev <= 1) {
+                      disconnect(); // Timeout reached
+                      return 0;
+                  }
+                  return prev - 1;
+              });
+          }, 1000);
+      }
+      return () => clearInterval(interval);
+  }, [status]);
+
 
   // --- Init ---
   useEffect(() => {
@@ -213,6 +241,7 @@ function App() {
                          setStatus(ConnectionStatus.CONNECTED);
                          setRequester(data.info);
                          setConn(connection);
+                         lastHeartbeat.current = Date.now();
                     } else {
                         setRequester(data.info);
                         setStatus(ConnectionStatus.INCOMING_REQUEST);
@@ -220,6 +249,18 @@ function App() {
                     }
                 } else if (data.type === 'disconnect') {
                     handleRemoteDisconnect();
+                } else if (data.type === 'heartbeat-ping') {
+                    connection.send({ type: 'heartbeat-pong' });
+                    lastHeartbeat.current = Date.now();
+                } else if (data.type === 'heartbeat-pong') {
+                    lastHeartbeat.current = Date.now();
+                    if (status === ConnectionStatus.RECONNECTING) setStatus(ConnectionStatus.CONNECTED);
+                } else if (data.type === 'mesh-toggle') {
+                    setIsMeshActive(data.active);
+                } else if (data.type === 'mesh-move') {
+                    setFiles(prev => prev.map(f => f.id === data.fileId ? { ...f, x: data.x, y: data.y } : f));
+                } else if (data.type === 'mesh-draw') {
+                    setStrokes(prev => [...prev, { ...data.stroke, isRemote: true }]);
                 } else {
                     handleIncomingData(data);
                 }
@@ -270,12 +311,25 @@ function App() {
               if (data.type === 'connection-accepted') {
                   setStatus(ConnectionStatus.CONNECTED);
                   setRequester({ id: targetId, nickname: targetNick, version: data.info?.version });
+                  lastHeartbeat.current = Date.now();
               } else if (data.type === 'connection-rejected') {
                   handleRemoteDisconnect();
                   setErrorMsg("Connection Rejected");
                   setTimeout(() => setErrorMsg(''), 3000);
               } else if (data.type === 'disconnect') {
                   handleRemoteDisconnect();
+              } else if (data.type === 'heartbeat-ping') {
+                  connection.send({ type: 'heartbeat-pong' });
+                  lastHeartbeat.current = Date.now();
+              } else if (data.type === 'heartbeat-pong') {
+                  lastHeartbeat.current = Date.now();
+                  if (status === ConnectionStatus.RECONNECTING) setStatus(ConnectionStatus.CONNECTED);
+              } else if (data.type === 'mesh-toggle') {
+                  setIsMeshActive(data.active);
+              } else if (data.type === 'mesh-move') {
+                  setFiles(prev => prev.map(f => f.id === data.fileId ? { ...f, x: data.x, y: data.y } : f));
+              } else if (data.type === 'mesh-draw') {
+                  setStrokes(prev => [...prev, { ...data.stroke, isRemote: true }]);
               } else {
                   handleIncomingData(data);
               }
@@ -292,6 +346,7 @@ function App() {
       if (!conn) return;
       conn.send({ type: 'connection-accepted', info: { version: APP_VERSION_STRING } });
       setStatus(ConnectionStatus.CONNECTED);
+      lastHeartbeat.current = Date.now();
   };
 
   const rejectConnection = () => {
@@ -307,6 +362,8 @@ function App() {
     setConn(null);
     setRequester(null);
     setFiles([]); 
+    setIsMeshActive(false);
+    setStrokes([]);
   };
 
   const disconnect = () => {
@@ -326,7 +383,10 @@ function App() {
         type: data.mime,
         progress: 0,
         direction: 'incoming',
-        startTime: Date.now()
+        startTime: Date.now(),
+        // Random placement for Mesh
+        x: Math.random() * 200 + 50,
+        y: Math.random() * 300 + 100
       }, ...prev]);
     } else if (data.type === 'file-full') {
         const blob = new Blob([new Uint8Array(data.buffer)], { type: data.mime });
@@ -373,7 +433,6 @@ function App() {
       if (compress) {
           try {
               const compressedBlob = await compressImage(file);
-              // Convert blob back to file-like object for transfer logic (keep name)
               const compressedFile = new File([compressedBlob], file.name, { type: file.type });
               startTransfer(compressedFile, id);
           } catch(e) {
@@ -395,7 +454,9 @@ function App() {
         type: file.type,
         progress: 0,
         direction: 'outgoing',
-        startTime: Date.now()
+        startTime: Date.now(),
+        x: Math.random() * 200 + 50,
+        y: Math.random() * 300 + 100
     };
     setFiles(prev => [newFile, ...prev]);
     addToVault(newFile);
@@ -420,11 +481,49 @@ function App() {
       setTimeout(() => setCopied(false), 2000);
   };
 
+  // --- Mesh Logic ---
+  const toggleMesh = () => {
+      const newState = !isMeshActive;
+      setIsMeshActive(newState);
+      if (conn) conn.send({ type: 'mesh-toggle', active: newState });
+  };
+
+  const handleMeshMove = (id: string, x: number, y: number) => {
+      setFiles(prev => prev.map(f => f.id === id ? { ...f, x, y } : f));
+      if (conn) conn.send({ type: 'mesh-move', fileId: id, x, y });
+  };
+
+  const handleDrawStart = (x: number, y: number) => {
+      setCurrentStroke({ id: uuidv4(), points: [{x,y}], color: '#FF3B30', isRemote: false });
+  };
+
+  const handleDrawMove = (x: number, y: number) => {
+      if (currentStroke) {
+          const newPoints = [...currentStroke.points, {x,y}];
+          setCurrentStroke({ ...currentStroke, points: newPoints });
+      }
+  };
+
+  const handleDrawEnd = () => {
+      if (currentStroke) {
+          setStrokes(prev => [...prev, currentStroke]);
+          if (conn) conn.send({ type: 'mesh-draw', stroke: currentStroke });
+          setCurrentStroke(null);
+      }
+  };
+
   // --- Views ---
+
+  const GlobalSettingsButton = (
+     <div className="fixed top-6 right-6 z-[200]">
+        <Button variant="glass" active={showSettings} onClick={() => setShowSettings(true)} icon={<Settings size={20}/>} className="w-12 h-12 rounded-full !p-0 shadow-xl" />
+     </div>
+  );
 
   if (!hasSetup) {
       return (
         <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center bg-[#F5F5F7]">
+             {GlobalSettingsButton}
              <motion.div initial={{scale:0.9, opacity:0}} animate={{scale:1, opacity:1}} className="max-w-md w-full">
                  <div className="w-20 h-20 bg-black text-white rounded-3xl flex items-center justify-center mx-auto mb-6 shadow-xl">
                      <Zap size={32} />
@@ -442,6 +541,20 @@ function App() {
                      Continue
                  </Button>
              </motion.div>
+             <AnimatePresence>
+                {showSettings && (
+                    <SettingsModal 
+                        isOpen={showSettings} 
+                        onClose={() => setShowSettings(false)}
+                        nickname={nickname}
+                        onUpdateNickname={(n) => { setNickname(n); localStorage.setItem('tronsfer_nickname', n); }}
+                        devSettings={devSettings}
+                        onUpdateDevSettings={setDevSettings}
+                        version={APP_VERSION_STRING}
+                        playSoundPreview={playSound}
+                    />
+                )}
+            </AnimatePresence>
         </div>
       );
   }
@@ -455,6 +568,8 @@ function App() {
         onDragLeave={() => setIsFocusMode(false)}
         onDrop={() => setIsFocusMode(false)}
     >
+        {GlobalSettingsButton}
+
         <input type="file" multiple ref={fileInputRef} onChange={(e) => {
              if (e.target.files) Array.from(e.target.files).forEach(prepareFileSend);
              e.target.value = '';
@@ -467,11 +582,10 @@ function App() {
                 </div>
                 <span className="font-bold text-lg tracking-tight">tRonsfer</span>
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 mr-12"> {/* mr-12 to avoid overlap with Global Settings */}
                 {devSettings.mediaVault && (
                     <Button variant="icon" active={showVault} onClick={() => setShowVault(!showVault)} icon={<Archive size={20}/>} />
                 )}
-                <Button variant="icon" active={showSettings} onClick={() => setShowSettings(true)} icon={<Settings size={20}/>} />
             </div>
         </div>
 
@@ -480,6 +594,14 @@ function App() {
                 <motion.div initial={{y:-50, opacity:0}} animate={{y:0, opacity:1}} exit={{y:-50, opacity:0}} className="fixed top-6 left-0 right-0 z-[200] flex justify-center pointer-events-none">
                     <div className="bg-red-500 text-white px-6 py-3 rounded-full shadow-xl font-bold text-sm flex items-center gap-2">
                         <AlertTriangle size={16}/> {errorMsg}
+                    </div>
+                </motion.div>
+            )}
+            
+            {status === ConnectionStatus.RECONNECTING && (
+                <motion.div initial={{y:-50, opacity:0}} animate={{y:0, opacity:1}} exit={{y:-50, opacity:0}} className="fixed top-20 left-0 right-0 z-[200] flex justify-center pointer-events-none">
+                    <div className="bg-orange-500 text-white px-6 py-3 rounded-full shadow-xl font-bold text-sm flex items-center gap-2">
+                        <Smartphone size={16} className="animate-pulse"/> Partner disconnected. Auto-close in {reconnectCountdown}s...
                     </div>
                 </motion.div>
             )}
@@ -492,7 +614,7 @@ function App() {
                     initial={{opacity: 0, scale: 0.95}} 
                     animate={{opacity: 1, scale: 1}} 
                     exit={{opacity: 0, scale: 0.95}}
-                    className="fixed inset-0 z-50 bg-white/90 backdrop-blur-xl flex flex-col p-8"
+                    className="fixed inset-0 z-[150] bg-white/95 backdrop-blur-xl flex flex-col p-8"
                 >
                     <div className="flex items-center justify-between mb-8 max-w-5xl mx-auto w-full">
                         <h2 className="text-3xl font-bold text-[#1D1D1F]">The Vault</h2>
@@ -503,11 +625,29 @@ function App() {
                     <div className="flex-1 overflow-y-auto max-w-5xl mx-auto w-full">
                          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
                             {vaultFiles.map((f, i) => (
-                                <div key={i} className="aspect-square bg-[#F5F5F7] rounded-2xl flex flex-col items-center justify-center border border-white p-4 shadow-sm hover:scale-105 transition-transform">
-                                    <div className="w-10 h-10 bg-white rounded-full flex items-center justify-center mb-2 shadow-sm">
-                                        <span className="text-xs font-bold text-gray-500">{f.type.split('/')[1]?.toUpperCase().substring(0,3)}</span>
-                                    </div>
-                                    <span className="font-semibold text-sm truncate w-full text-center text-gray-700">{f.name}</span>
+                                <div 
+                                    key={i} 
+                                    onClick={() => {
+                                        // Try to find the live file in the session first to get the URL
+                                        const liveFile = files.find(lf => lf.id === f.id);
+                                        if (liveFile && liveFile.url) {
+                                            setActiveFilePreview(liveFile);
+                                        } else {
+                                            setErrorMsg("File expired (Session ended)");
+                                            setTimeout(() => setErrorMsg(''), 2000);
+                                        }
+                                    }}
+                                    className="aspect-square bg-[#F5F5F7] rounded-2xl flex flex-col items-center justify-center border border-white p-4 shadow-sm hover:scale-105 transition-transform cursor-pointer relative group"
+                                >
+                                    {f.type.startsWith('image') ? (
+                                        <div className="absolute inset-0 flex items-center justify-center opacity-50"><Palette className="text-gray-300"/></div>
+                                    ) : (
+                                        <div className="w-10 h-10 bg-white rounded-full flex items-center justify-center mb-2 shadow-sm relative z-10">
+                                            <span className="text-xs font-bold text-gray-500">{f.type.split('/')[1]?.toUpperCase().substring(0,3)}</span>
+                                        </div>
+                                    )}
+                                    <span className="font-semibold text-sm truncate w-full text-center text-gray-700 relative z-10">{f.name}</span>
+                                    <div className="absolute bottom-2 text-[10px] text-gray-400">Click to Open</div>
                                 </div>
                             ))}
                         </div>
@@ -606,8 +746,8 @@ function App() {
                             <button onClick={disconnect} className="mt-8 px-6 py-2 bg-gray-100 rounded-full font-bold text-gray-600 hover:bg-gray-200">Cancel</button>
                         </div>
                     ) : (
-                        <div className="flex flex-col h-full w-full">
-                            <div className="px-8 py-6 border-b border-gray-100 flex items-center justify-between safe-top">
+                        <div className="flex flex-col h-full w-full relative">
+                            <div className="px-8 py-6 border-b border-gray-100 flex items-center justify-between safe-top bg-white/80 backdrop-blur z-20">
                                 <div className="flex items-center gap-4">
                                      <div className="w-12 h-12 bg-green-50 rounded-full flex items-center justify-center text-green-600 shadow-sm border border-green-100">
                                          {devSettings.e2eEncryption ? <ShieldCheck size={24} /> : <Check size={24} />}
@@ -619,49 +759,51 @@ function App() {
                                          </div>
                                      </div>
                                 </div>
-                                <button onClick={disconnect} className="px-5 py-2 bg-gray-50 rounded-full text-sm font-bold text-gray-600 hover:bg-red-50 hover:text-red-600 transition-colors">
-                                     Disconnect
-                                </button>
+                                <div className="flex gap-2">
+                                    <button onClick={toggleMesh} className={`px-4 py-2 rounded-full text-sm font-bold transition-colors flex items-center gap-2 ${isMeshActive ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-50 text-gray-600'}`}>
+                                         {isMeshActive ? <Palette size={16}/> : <ListIcon size={16}/>}
+                                         {isMeshActive ? 'Mesh Active' : 'List View'}
+                                    </button>
+                                    <button onClick={disconnect} className="px-5 py-2 bg-gray-50 rounded-full text-sm font-bold text-gray-600 hover:bg-red-50 hover:text-red-600 transition-colors">
+                                        Disconnect
+                                    </button>
+                                </div>
                             </div>
 
-                            {/* Shared Canvas (The Mesh) or List */}
-                            <div className="flex-1 overflow-y-auto p-6 space-y-3 bg-[#F9F9FB]/50">
-                                {files.length === 0 && (
-                                    <div className="h-full flex flex-col items-center justify-center opacity-40">
-                                        <p className="font-medium text-lg text-gray-900">No files shared yet</p>
-                                    </div>
-                                )}
-                                
-                                {devSettings.sharedCanvas ? (
-                                    <div className="grid grid-cols-3 gap-4">
+                            {/* Main Content Area */}
+                            <div className="flex-1 relative overflow-hidden bg-[#F9F9FB]/50">
+                                {isMeshActive ? (
+                                    <MeshCanvas 
+                                        files={files} 
+                                        strokes={[...strokes, ...(currentStroke ? [currentStroke] : [])]}
+                                        onMove={handleMeshMove}
+                                        onOpen={(f) => f.progress === 100 && setActiveFilePreview(f)}
+                                        onDrawStart={handleDrawStart}
+                                        onDrawMove={handleDrawMove}
+                                        onDrawEnd={handleDrawEnd}
+                                    />
+                                ) : (
+                                    <div className="h-full overflow-y-auto p-6 space-y-3">
+                                        {files.length === 0 && (
+                                            <div className="h-full flex flex-col items-center justify-center opacity-40">
+                                                <p className="font-medium text-lg text-gray-900">No files shared yet</p>
+                                            </div>
+                                        )}
                                         {files.map(f => (
-                                            <div 
-                                                key={f.id} 
-                                                onClick={() => f.progress === 100 && setActiveFilePreview(f)} 
-                                                className="bg-white aspect-square rounded-2xl shadow-sm border border-gray-200 flex flex-col items-center justify-center cursor-grab active:cursor-grabbing hover:scale-105 transition-transform"
-                                            >
-                                                <div className="w-12 h-12 bg-gray-50 rounded-full mb-2 flex items-center justify-center text-blue-500 font-bold text-xs border border-gray-100">
-                                                    {f.type.split('/')[1]?.substring(0,3).toUpperCase()}
-                                                </div>
-                                                <p className="text-xs font-bold text-center w-full px-2 truncate">{f.name}</p>
+                                            <div key={f.id} onClick={() => f.progress === 100 && setActiveFilePreview(f)} className="cursor-pointer active:scale-[0.99] transition-transform">
+                                                <FilePreview file={f} privacyMode={devSettings.privacyVeil} />
                                             </div>
                                         ))}
                                     </div>
-                                ) : (
-                                    files.map(f => (
-                                        <div key={f.id} onClick={() => f.progress === 100 && setActiveFilePreview(f)} className="cursor-pointer active:scale-[0.99] transition-transform">
-                                            <FilePreview file={f} privacyMode={devSettings.privacyVeil} />
-                                        </div>
-                                    ))
                                 )}
                             </div>
 
-                            <div className="p-6 border-t border-gray-100 bg-white safe-bottom">
+                            <div className="p-6 border-t border-gray-100 bg-white safe-bottom z-20">
                                  <button 
                                     onClick={() => fileInputRef.current?.click()}
                                     className="w-full py-4 bg-[#007AFF] text-white rounded-[20px] font-bold text-lg hover:bg-blue-600 active:scale-95 transition-all shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2"
                                  >
-                                     <Plus size={24} /> Send File
+                                     <Plus size={24} /> Drop File
                                  </button>
                             </div>
                         </div>

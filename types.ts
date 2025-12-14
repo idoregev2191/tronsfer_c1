@@ -13,6 +13,7 @@ export enum ConnectionStatus {
   REQUESTING = 'REQUESTING',
   INCOMING_REQUEST = 'INCOMING_REQUEST',
   CONNECTED = 'CONNECTED',
+  RECONNECTING = 'RECONNECTING', // New status
   ERROR = 'ERROR'
 }
 
@@ -28,15 +29,17 @@ export interface FileMeta {
   startTime?: number;
   timeRemaining?: string;
   speed?: string;
-  // Mesh Coordinates
+  // Mesh Data
   x?: number;
   y?: number;
+  rotation?: number;
 }
 
-export interface TronsferID {
-  username: string;
-  registeredAt: number;
-  history: Array<{ peerId: string, timestamp: number, nickname: string }>;
+export interface DrawStroke {
+  id: string;
+  points: {x: number, y: number}[];
+  color: string;
+  isRemote: boolean;
 }
 
 export interface CloudUser {
